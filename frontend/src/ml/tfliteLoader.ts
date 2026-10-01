@@ -1,69 +1,56 @@
-import { loadTensorflowModel, type TfliteModel } from 'react-native-fast-tflite';
+import {
+  loadTensorflowModel,
+  type TfliteModel,
+} from 'react-native-fast-tflite';
 
 
 let faceModel: TfliteModel | null = null;
 
 
-/**
- * Load Face Landmark TFLite Model
- * Singleton loader to avoid loading model multiple times
- */
+
 export async function loadFaceModel(): Promise<TfliteModel> {
 
-  if (faceModel) {
+
+  if(faceModel){
     return faceModel;
   }
 
 
-  try {
+  const MODEL =
+    require('../../assets/models/face_landmark.tflite');
 
-    const MODEL = require('../../assets/models/face_landmark.tflite');
 
-
-    faceModel = await loadTensorflowModel(
+  faceModel =
+    await loadTensorflowModel(
       MODEL,
       []
     );
 
 
-    console.log(
-      "Face landmark model loaded successfully"
-    );
+  console.log(
+    "Face landmark model loaded"
+  );
 
 
-    console.log(
-      "Model Inputs:",
-      faceModel.inputs
-    );
+  console.log(
+    "INPUTS",
+    faceModel.inputs
+  );
 
 
-    console.log(
-      "Model Outputs:",
-      faceModel.outputs
-    );
+  console.log(
+    "OUTPUTS",
+    faceModel.outputs
+  );
 
 
-    return faceModel;
+  return faceModel;
 
-
-  } catch (error) {
-
-
-    console.log(
-      "Failed to load face landmark model:",
-      error
-    );
-
-
-    throw error;
-  }
 }
 
 
-/**
- * Get already loaded model
- */
-export function getFaceModel(): TfliteModel | null {
+
+export function getFaceModel(){
 
   return faceModel;
 

@@ -1,0 +1,8 @@
+{
+  "devDependencies": {
+    "@types/react-native-vector-icons": "^6.4.18"
+  },
+  "dependencies": {
+    "@react-native-vector-icons/ionicons": "^13.1.4"
+  }
+}

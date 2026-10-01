@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "685443010530",
+    "project_id": "activewatch-dms-8794e",
+    "storage_bucket": "activewatch-dms-8794e.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:685443010530:android:08280ba9e2ba7dd15233bb",
+        "android_client_info": {
+          "package_name": "com.activewatchdms"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "685443010530-9brso6r3p4cjedf3arctk14gess23erm.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDA4-GD6Azb4AZyW8DlpAYvBiaCCV-_-a0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "685443010530-9brso6r3p4cjedf3arctk14gess23erm.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

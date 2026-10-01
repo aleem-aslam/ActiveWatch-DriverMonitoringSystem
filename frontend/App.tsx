@@ -1,163 +1,59 @@
-import React, {
-  useEffect,
-  useState
-} from 'react';
-
-import {
-  View,
-  Text,
-  StyleSheet
-} from 'react-native';
+import React from "react";
 
 
 import {
-  loadFaceModel
-} from './src/ml/tfliteLoader';
+NavigationContainer
+}
+from "@react-navigation/native";
 
 
-import CameraScreen from './src/camera/CameraScreen';
+import RootNavigator
+from "./src/navigation/RootNavigator";
+
+
+import {
+AuthProvider
+}
+from "./src/context/AuthContext";
+
+
+import {
+ThemeProvider
+}
+from "./src/theme/ThemeContext";
+
+
 
 
 
 export default function App(){
 
 
-  const [loading,setLoading] =
-    useState(true);
+return(
 
 
-  const [error,setError] =
-    useState<string | null>(null);
+<ThemeProvider>
 
 
+<AuthProvider>
 
-  useEffect(()=>{
 
+<NavigationContainer>
 
-    async function init(){
 
+<RootNavigator/>
 
-      try{
 
+</NavigationContainer>
 
-        await loadFaceModel();
 
+</AuthProvider>
 
-        setLoading(false);
 
+</ThemeProvider>
 
-      }
-      catch(e:any){
 
-
-        setError(
-          e.message
-        );
-
-
-      }
-
-
-    }
-
-
-    init();
-
-
-  },[]);
-
-
-
-
-
-  if(error){
-
-
-    return(
-
-      <View style={styles.center}>
-
-
-        <Text style={styles.error}>
-
-          Model Error:
-
-          {'\n'}
-
-          {error}
-
-        </Text>
-
-
-      </View>
-
-    );
-
-
-  }
-
-
-
-
-  if(loading){
-
-
-    return(
-
-      <View style={styles.center}>
-
-
-        <Text style={styles.text}>
-
-          Loading AI Model...
-
-        </Text>
-
-
-      </View>
-
-    );
-
-
-  }
-
-
-
-
-  return(
-
-    <CameraScreen/>
-
-  );
+);
 
 
 }
-
-
-
-
-
-const styles =
-StyleSheet.create({
-
-
-center:{
- flex:1,
- justifyContent:'center',
- alignItems:'center'
-},
-
-
-text:{
- fontSize:20
-},
-
-
-error:{
- color:'red',
- fontSize:16,
- padding:20
-}
-
-
-});
