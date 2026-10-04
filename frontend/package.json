@@ -28,12 +28,14 @@
     "react-native-fast-tflite": "^3.0.1",
     "react-native-fs": "^2.20.0",
     "react-native-image-resizer": "^1.4.5",
-    "react-native-nitro-image": "^0.15.2",
     "react-native-nitro-modules": "^0.37.1",
     "react-native-safe-area-context": "^5.10.0",
     "react-native-screens": "^4.28.0",
     "react-native-sound": "^0.13.0",
-    "react-native-vision-camera": "^5.2.3"
+    "react-native-vision-camera": "^5.2.3",
+    "react-native-vision-camera-resizer": "^5.2.3",
+    "react-native-vision-camera-worklets": "^5.2.3",
+    "react-native-worklets": "^0.13.0"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",

@@ -1,90 +1,77 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { StyleSheet, Text, View, useWindowDimensions } from 'react-native';
-import { Camera, useCameraDevice, usePhotoOutput, type CameraRef } from 'react-native-vision-camera';
-import { loadFaceModel, getFaceModel } from '../ml/tfliteLoader';
-import { captureAndPreprocess } from './frameCapture';
-import { roiFromLandmarks } from '../ml/imagePreprocessor';
+import { LayoutChangeEvent, Platform, StyleSheet, Text, Vibration, View } from 'react-native';
+import { Camera, useCameraDevice, useFrameOutput, type Frame } from 'react-native-vision-camera';
+import { useTensorflowModel } from 'react-native-fast-tflite';
+import { createSynchronizable, scheduleOnRN } from 'react-native-worklets';
+import { preprocessFrame, floatRgbToRgba, MODEL_INPUT_SIZE } from '../ml/framePreprocessor';
+
 import { runFaceLandmarkModel } from '../ml/drowsinessDetector';
 import { isFaceGeometryPlausible } from '../ml/faceValidator';
 import { calculateEAR } from '../ml/earCalculator';
 import { DrowsinessStateMachine } from '../ml/drowsinessState';
-import { DrowsinessLevel, type DrowsinessSnapshot, type Roi } from '../../types';
-import { loadAlertSound, playAlertBeep, unloadAlertSound } from '../services/beepAlert';
+import { configFromSettings } from '../ml/detectionConfig';
+import { DrowsinessLevel, type DrowsinessSnapshot } from '../../types';
+import { loadAlertSound, playAlertBeep, stopAlertBeep, unloadAlertSound } from '../services/beepAlert';
+import { useSettings } from '../hooks/useSettings';
+import { rgbaToJpegBase64 } from '../utils/jpegBase64';
+import { saveDrowsyEvent } from '../firebase/drowsyEventService';
 
-// Target time between the START of one capture cycle and the next. The
-// actual achieved rate will be lower than 1000/CYCLE_INTERVAL_MS whenever a
-// cycle (snapshot + decode + inference) takes longer than this — the loop
-// below accounts for that by scheduling from *completion* time, not with a
-// fixed-rate setInterval, so cycles never stack up on a slow device.
-const CYCLE_INTERVAL_MS = 125; // ~8/sec ceiling; real-world rate will vary
+const MODEL_ASSET = require('../assets/models/face_landmark.tflite');
 
-// Most front-camera previews are shown mirrored (like a mirror) even though
-// the saved/captured photo usually is NOT mirrored. If the box below ends up
-// on the wrong side of your face, flip this to false.
-const MIRROR_PREVIEW = true;
+// Front-camera previews are normally shown mirrored. If the box moves the
+// opposite way to your face horizontally, flip this to false.
+const MIRROR_BOX = true;
 
-/**
- * Maps a Roi expressed in captured-photo pixel space (frameW x frameH) onto
- * the on-screen rectangle it corresponds to, given the screen's size.
- * Assumes the preview uses VisionCamera's default resizeMode="cover".
- * This is pure math only — it is called during render and never touches
- * capture, inference, or state, so it cannot affect detection.
- */
-function mapRoiToViewRect(
-  roi: Roi,
-  frameW: number,
-  frameH: number,
-  viewW: number,
-  viewH: number
-) {
-  if (!frameW || !frameH || !viewW || !viewH) return null;
+const GREEN = '#22c55e';
+const RED = '#ef4444';
 
-  const scale = Math.max(viewW / frameW, viewH / frameH);
-  const offsetX = (viewW - frameW * scale) / 2;
-  const offsetY = (viewH - frameH * scale) / 2;
+const NO_FACE_ALERT_AFTER_MS = 3000; // "No Face Detected Alert": face missing this long -> alert
+const MIN_SAVE_INTERVAL_MS = 10000; // at most one saved drowsy snapshot per 10 s
+const ALERT_GAP_MS = 800; // pause between repeated alerts
 
-  let left = roi.x * scale + offsetX;
-  const top = roi.y * scale + offsetY;
-  const size = roi.size * scale;
+// Face box in normalized (0..1) frame coordinates, plus the frame size it was
+// computed from (needed to map onto the screen under resizeMode="cover").
+type FaceBox = { x0: number; y0: number; x1: number; y1: number; frameW: number; frameH: number };
 
-  if (MIRROR_PREVIEW) {
-    left = viewW - (left + size);
+function computeFaceBox(landmarks: any[], frameW: number, frameH: number): FaceBox | null {
+  if (!landmarks || landmarks.length === 0) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of landmarks) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
   }
+  // Landmarks are in model-input pixels (0..192); tolerate already-normalized output too.
+  const div = Math.max(maxX, maxY) > 2 ? MODEL_INPUT_SIZE : 1;
+  const padX = ((maxX - minX) / div) * 0.1;
+  const padY = ((maxY - minY) / div) * 0.1;
+  const clamp = (v: number) => Math.max(0, Math.min(1, v));
 
-  return { left, top, width: size, height: size };
+  // Landmarks are 0..1 within the centered SQUARE crop the preprocessor took
+  // (side = min(frameW, frameH)). Convert to 0..1 of the FULL frame.
+  const side = Math.min(frameW, frameH);
+  const cropX0 = (frameW - side) / 2;
+  const cropY0 = (frameH - side) / 2;
+  const toFrameX = (nx: number) => clamp((cropX0 + nx * side) / frameW);
+  const toFrameY = (ny: number) => clamp((cropY0 + ny * side) / frameH);
+
+  return {
+    x0: toFrameX(minX / div - padX),
+    y0: toFrameY(minY / div - padY),
+    x1: toFrameX(maxX / div + padX),
+    y1: toFrameY(maxY / div + padY),
+    frameW,
+    frameH,
+  };
 }
 
 export default function CameraScreen() {
-  const [model, setModel] = useState<any>(null);
   const device = useCameraDevice('front');
-  const cameraRef = useRef<CameraRef>(null);
-  // Read screen size directly instead of an onLayout+setState round trip —
-  // same information, without adding an extra render near the camera.
-  const { width: screenW, height: screenH } = useWindowDimensions();
+  const { settings, uid } = useSettings();
 
-  // `setSnapshot` re-renders this component every cycle, which previously
-  // recreated this whole options object (and its nested targetResolution
-  // object) on every render. If usePhotoOutput treats a changed options
-  // reference as "rebuild the output," that tears down and rebinds the
-  // native photo pipeline constantly -- which matches the logs showing
-  // some cycles capturing fine and others failing moments later.
-  const photoOutputOptions = useMemo(
-    () => ({
-      containerFormat: 'jpeg' as const,
-      quality: 0.6,
-      qualityPrioritization: (device?.supportsSpeedQualityPrioritization ? 'speed' : 'balanced') as
-        | 'speed'
-        | 'balanced',
-      targetResolution: { width: 640, height: 480 }, // plenty for a 192x192 crop, much cheaper to rotate
-    }),
-    [device?.supportsSpeedQualityPrioritization]
-  );
-  const photoOutput = usePhotoOutput(photoOutputOptions);
-  // Stable array reference for the `outputs` prop. `outputs={[photoOutput]}`
-  // would otherwise create a brand-new array every render; memoizing avoids
-  // handing the native camera a "changed" outputs list when nothing
-  // actually changed.
-  const outputs = useMemo(() => [photoOutput], [photoOutput]);
+  const modelHook = useTensorflowModel(MODEL_ASSET, []);
+  const tfModel = modelHook.model;
 
   const [snapshot, setSnapshot] = useState<DrowsinessSnapshot>({
     level: DrowsinessLevel.NO_FACE,
@@ -93,176 +80,246 @@ export default function CameraScreen() {
     faceScore: 0,
     timestamp: Date.now(),
   });
+  const [faceBox, setFaceBox] = useState<FaceBox | null>(null);
+  const [viewSize, setViewSize] = useState({ w: 0, h: 0 });
+  const [noFaceAlertOn, setNoFaceAlertOn] = useState(false);
 
   const stateMachineRef = useRef(new DrowsinessStateMachine());
-  const trackedRoiRef = useRef<Roi | undefined>(undefined);
-  const runningRef = useRef(false);
-  const mountedRef = useRef(true);
-  const frameSizeRef = useRef({ width: 0, height: 0 });
-  // `device` is available almost immediately, but the native camera session
-  // takes a bit longer to actually bind. Capturing before that finishes is
-  // what throws "Not bound to a valid Camera" / "session/camera-not-ready".
-  const [cameraReady, setCameraReady] = useState(false);
+  const lastEarLogRef = useRef(0);
+  const fpsFramesRef = useRef(0);
+
+  // The frame-output callback below is created once (memoized) and keeps
+  // calling the SAME processFaceDataOnJS, so anything that can change over time
+  // must be read through refs, never straight from state/props.
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const uidRef = useRef(uid);
+  uidRef.current = uid;
+  const lastSnapshotRef = useRef<DrowsinessSnapshot | null>(null);
+  const lastSavedAtRef = useRef(0);
+
+  // JS -> worklet flag: "grab the next frame as a snapshot".
+  const captureRequest = useMemo(() => createSynchronizable(false), []);
 
   useEffect(() => {
     loadAlertSound();
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      unloadAlertSound();
-    };
+    return () => unloadAlertSound();
   }, []);
 
+  // Settings -> detection: sensitivity and drowsiness time reach the state machine.
   useEffect(() => {
-    async function init() {
-      try {
-        const loaded = await loadFaceModel();
-        setModel(loaded);
-      } catch (e) {
-        console.log('MODEL ERROR', e);
-      }
-    }
-    init();
-  }, []);
+    stateMachineRef.current.setConfig(configFromSettings(settings));
+  }, [settings.drowsinessSensitivity, settings.drowsinessTimeSeconds]);
 
-  useEffect(() => {
-    if (model && device && cameraReady) {
-      runningRef.current = true;
-      runLoop();
-    }
-    return () => {
-      runningRef.current = false;
-    };
-  }, [model, device, cameraReady]);
-
-  async function runLoop() {
-    while (runningRef.current && mountedRef.current) {
-      const cycleStart = Date.now();
-      try {
-        await runOneCycle();
-      } catch (e) {
-        // A single failed cycle (camera busy, decode hiccup) shouldn't kill
-        // the loop — just skip this cycle and keep going.
-        console.warn('Drowsiness detection cycle failed:', e);
-      }
-      const elapsed = Date.now() - cycleStart;
-      const wait = Math.max(0, CYCLE_INTERVAL_MS - elapsed);
-      await new Promise<void>((resolve) => setTimeout(() => resolve(), wait));
+  // Saves the snapshot the worklet captured. Only used via refs (see note above).
+  async function handleCapturedImage(rgba: ArrayBuffer) {
+    const currentUid = uidRef.current;
+    const s = settingsRef.current;
+    if (!currentUid || !s.saveDrowsyImages) return; // guests can't save to Firebase
+    try {
+      const imageBase64 = rgbaToJpegBase64(new Uint8Array(rgba), MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, 70);
+      const snap = lastSnapshotRef.current;
+      await saveDrowsyEvent(currentUid, {
+        imageBase64,
+        ear: snap?.ear ?? 0,
+        eyesClosedForMs: Math.round(snap?.eyesClosedForMs ?? 0),
+        drowsyTimeSeconds: s.drowsinessTimeSeconds,
+      });
+      console.log('[drowsy-image] saved to Firebase');
+    } catch (error) {
+      console.warn('[drowsy-image] failed to save:', error);
     }
   }
 
-  async function runOneCycle() {
-    if (!model) return;
-    // onStarted means the CameraSession overall has begun, but this specific
-    // output can finish attaching slightly later. currentResolution is
-    // documented as undefined until this output is connected to the
-    // session -- check it directly instead of assuming onStarted covers it.
-    if (!photoOutput.currentResolution) {
-      console.log('Photo output not connected to the session yet, skipping cycle');
+  // Plain JS function on the React/JS thread, invoked from the worklet via scheduleOnRN.
+  function processFaceDataOnJS(outputs: ArrayBuffer[], frameW: number, frameH: number, capturedRgba: ArrayBuffer | null) {
+    if (capturedRgba) handleCapturedImage(capturedRgba);
+    if (!outputs || outputs.length === 0) return;
+
+    const face = runFaceLandmarkModel(outputs);
+    const isValid = face ? isFaceGeometryPlausible(face) : false;
+
+    let currentEar = 0;
+    if (isValid && face?.landmarks) {
+      currentEar = calculateEAR(face.landmarks).average;
+    }
+
+    const next = stateMachineRef.current.update(
+      currentEar,
+      face?.faceScore || 0,
+      isValid,
+      Date.now()
+    );
+    lastSnapshotRef.current = next;
+
+    // TEMP diagnostic (about 1x/second): processed FPS + EAR vs. state, to tune thresholds.
+    fpsFramesRef.current += 1;
+    const nowMs = Date.now();
+    if (nowMs - lastEarLogRef.current > 1000) {
+      const fps = (fpsFramesRef.current * 1000) / (nowMs - lastEarLogRef.current);
+      fpsFramesRef.current = 0;
+      lastEarLogRef.current = nowMs;
+      console.log(
+        `[EAR] fps=${fps.toFixed(1)} ear=${currentEar.toFixed(3)} level=${next.level} closedMs=${Math.round(next.eyesClosedForMs)} valid=${isValid}`
+      );
+    }
+
+    setSnapshot(next);
+    setFaceBox(
+      isValid && face?.landmarks && next.level !== DrowsinessLevel.NO_FACE
+        ? computeFaceBox(face.landmarks, frameW, frameH)
+        : null
+    );
+  }
+
+  // Memoized so the native frame pipeline isn't rebuilt on every re-render
+  // (setSnapshot re-renders this screen every processed frame).
+  const frameOutputOptions = useMemo(
+    () => ({
+      pixelFormat: 'rgb' as const,
+      dropFramesWhileBusy: true,
+      enablePhysicalBufferRotation: true,
+      onFrame(frame: Frame) {
+        'worklet';
+        if (tfModel == null) {
+          frame.dispose();
+          return;
+        }
+        try {
+          const input = preprocessFrame(frame);
+          const outputs = tfModel.runSync([input.buffer as ArrayBuffer]);
+
+          // If JS asked for a snapshot, send this exact frame's crop along (once).
+          let capturedRgba: ArrayBuffer | null = null;
+          if (captureRequest.getBlocking()) {
+            captureRequest.setBlocking(false);
+            capturedRgba = floatRgbToRgba(input).buffer as ArrayBuffer;
+          }
+
+          scheduleOnRN(processFaceDataOnJS, outputs, frame.width, frame.height, capturedRgba);
+        } catch (error) {
+          console.error('[worklet] Frame Processor Error:', error);
+        } finally {
+          frame.dispose();
+        }
+      },
+    }),
+    [tfModel, captureRequest]
+  );
+  const frameOutput = useFrameOutput(frameOutputOptions);
+
+  const isDrowsy = snapshot.level === DrowsinessLevel.DROWSY;
+
+  // "Save Drowsy Images": when a drowsy episode starts, ask the worklet for a snapshot.
+  useEffect(() => {
+    if (!isDrowsy || !settings.saveDrowsyImages || !uid) return;
+    const now = Date.now();
+    if (now - lastSavedAtRef.current < MIN_SAVE_INTERVAL_MS) return;
+    lastSavedAtRef.current = now;
+    captureRequest.setBlocking(true);
+  }, [isDrowsy, settings.saveDrowsyImages, uid, captureRequest]);
+
+  // "No Face Detected Alert": only after the face has been missing for a few seconds.
+  useEffect(() => {
+    if (!settings.noFaceAlert || snapshot.level !== DrowsinessLevel.NO_FACE || modelHook.state !== 'loaded') {
+      setNoFaceAlertOn(false);
       return;
     }
+    const t = setTimeout(() => setNoFaceAlertOn(true), NO_FACE_ALERT_AFTER_MS);
+    return () => {
+      clearTimeout(t);
+      setNoFaceAlertOn(false);
+    };
+  }, [settings.noFaceAlert, snapshot.level, modelHook.state]);
 
-    const captured = await captureAndPreprocess(photoOutput, trackedRoiRef.current);
-    if (!captured) return;
-    frameSizeRef.current = { width: captured.frameWidth, height: captured.frameHeight };
+  // Beep + vibrate while drowsy (or while the no-face alert is on): fire at once, then
+  // repeat. Duration and the sound / vibration switches come from Settings. Driven by the
+  // alert state CHANGING, not by every frame, so sounds can't pile up.
+  const alertActive = isDrowsy || noFaceAlertOn;
+  useEffect(() => {
+    if (!alertActive) return;
+    const durationMs = Math.round(settings.alertDurationSeconds * 1000);
+    const fireAlert = () => {
+      if (settings.alertSound) playAlertBeep(durationMs);
+      if (settings.vibration) Vibration.vibrate(durationMs);
+    };
+    fireAlert();
+    const id = setInterval(fireAlert, durationMs + ALERT_GAP_MS);
+    return () => {
+      clearInterval(id);
+      Vibration.cancel();
+      stopAlertBeep(); // silence immediately, don't let it finish playing
+    };
+  }, [alertActive, settings.alertSound, settings.vibration, settings.alertDurationSeconds]);
 
-    // fast-tflite v3 (Nitro) takes/returns raw ArrayBuffers, not typed arrays
-    const modelOutputs = await model.run([captured.input.buffer as ArrayBuffer]);
-    const face = runFaceLandmarkModel(modelOutputs);
-    console.log('FACE RESULT', face);
-    const isValid = isFaceGeometryPlausible(face);
+  // Map the normalized face box onto the screen, assuming the preview uses
+  // resizeMode="cover" (scale to fill, crop the overflow, centered).
+  const boxStyle = useMemo(() => {
+    if (!faceBox || viewSize.w === 0 || viewSize.h === 0) return null;
+    const scale = Math.max(viewSize.w / faceBox.frameW, viewSize.h / faceBox.frameH);
+    const dispW = faceBox.frameW * scale;
+    const dispH = faceBox.frameH * scale;
+    const offX = (viewSize.w - dispW) / 2;
+    const offY = (viewSize.h - dispH) / 2;
 
-    if (isValid) {
-      const cropRoi =
-        trackedRoiRef.current ?? {
-          x: (captured.frameWidth - Math.min(captured.frameWidth, captured.frameHeight)) / 2,
-          y: (captured.frameHeight - Math.min(captured.frameWidth, captured.frameHeight)) / 2,
-          size: Math.min(captured.frameWidth, captured.frameHeight),
-        };
-      trackedRoiRef.current = roiFromLandmarks(
-        new Float32Array(modelOutputs[0]),
-        cropRoi,
-        captured.frameWidth,
-        captured.frameHeight
-      );
-    } else {
-      trackedRoiRef.current = undefined; // fall back to centered crop next cycle
+    let left = faceBox.x0 * dispW + offX;
+    let right = faceBox.x1 * dispW + offX;
+    if (MIRROR_BOX) {
+      const l = viewSize.w - right;
+      const r = viewSize.w - left;
+      left = l;
+      right = r;
     }
+    const top = faceBox.y0 * dispH + offY;
+    const bottom = faceBox.y1 * dispH + offY;
+    return { left, top, width: right - left, height: bottom - top };
+  }, [faceBox, viewSize]);
 
-    const ear = calculateEAR(face.landmarks).average;
-    const next = stateMachineRef.current.update(ear, face.faceScore, isValid, Date.now());
+  const onLayout = (e: LayoutChangeEvent) =>
+    setViewSize({ w: e.nativeEvent.layout.width, h: e.nativeEvent.layout.height });
 
-    if (!mountedRef.current) return;
-    setSnapshot(next);
-    if (next.level === DrowsinessLevel.DROWSY) {
-      playAlertBeep();
-    }
+  if (!device) {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.centerText}>No front camera found</Text>
+      </View>
+    );
   }
 
-  if (!device) return <Text>No front camera found</Text>;
-  if (!model) return <Text>Model Loading...</Text>;
-
-  const boxRect = trackedRoiRef.current
-    ? mapRoiToViewRect(
-        trackedRoiRef.current,
-        frameSizeRef.current.width,
-        frameSizeRef.current.height,
-        screenW,
-        screenH
-      )
-    : null;
-
-  const boxColor =
-    snapshot.level === DrowsinessLevel.DROWSY
-      ? '#ff3b30'
-      : snapshot.level === DrowsinessLevel.WARNING
-      ? '#ffcc00'
-      : '#2ecc71';
-
-  const showAlertBanner =
-    snapshot.level === DrowsinessLevel.WARNING || snapshot.level === DrowsinessLevel.DROWSY;
+  const boxColor = isDrowsy ? RED : GREEN;
 
   return (
-    <View style={styles.container}>
+    <View style={styles.container} onLayout={onLayout}>
       <Camera
-        ref={cameraRef}
         style={StyleSheet.absoluteFill}
         device={device}
         isActive={true}
-        outputs={outputs}
-        onStarted={() => setCameraReady(true)}
-        onError={(e) => console.warn('Camera error', e)}
+        outputs={[frameOutput]}
+        onError={(e) => console.error('Camera onError:', e.message, e)}
       />
 
-      {boxRect && (
-        <View
-          pointerEvents="none"
-          style={[
-            styles.faceBox,
-            {
-              left: boxRect.left,
-              top: boxRect.top,
-              width: boxRect.width,
-              height: boxRect.height,
-              borderColor: boxColor,
-            },
-          ]}
-        />
+      {modelHook.state !== 'loaded' && (
+        <View style={styles.loadingOverlay}>
+          <Text style={styles.text}>Model Loading...</Text>
+        </View>
       )}
 
-      {showAlertBanner && (
-        <View
-          pointerEvents="none"
-          style={[
-            styles.alertBanner,
-            { backgroundColor: snapshot.level === DrowsinessLevel.DROWSY ? '#ff3b30' : '#ffcc00' },
-          ]}
-        >
-          <Text style={styles.alertBannerText}>
-            {snapshot.level === DrowsinessLevel.DROWSY
-              ? '\u26A0 DROWSINESS DETECTED \u2014 WAKE UP'
-              : '\u26A0 Eyes closing \u2014 stay alert'}
-          </Text>
+      {modelHook.state === 'loaded' && boxStyle && (
+        <View pointerEvents="none" style={[styles.faceBox, boxStyle, { borderColor: boxColor }]} />
+      )}
+
+      {modelHook.state === 'loaded' && snapshot.level === DrowsinessLevel.NO_FACE && (
+        <View pointerEvents="none" style={styles.noFaceOverlay}>
+          <Text style={styles.noFaceText}>FACE</Text>
+          <Text style={styles.noFaceText}>NOT DETECTED</Text>
+          <View style={styles.noFaceLine} />
+        </View>
+      )}
+
+      {modelHook.state === 'loaded' && isDrowsy && (
+        <View pointerEvents="none" style={styles.warningBanner}>
+          <Text style={styles.warningIcon}>⚠</Text>
+          <Text style={styles.warningText}>DROWSINESS DETECTED</Text>
         </View>
       )}
     </View>
@@ -270,24 +327,38 @@ export default function CameraScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1 },
+  container: { flex: 1, backgroundColor: 'black' },
+  centerText: { color: 'white', alignSelf: 'center', marginTop: 50 },
+  loadingOverlay: {
+    position: 'absolute', top: 0, bottom: 0, left: 0, right: 0,
+    backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'center', alignItems: 'center',
+  },
+  text: { color: 'white', fontSize: 16, marginBottom: 4 },
   faceBox: {
     position: 'absolute',
-    borderWidth: 3,
-    borderRadius: 8,
+    borderWidth: 4,
+    borderRadius: 16,
   },
-  alertBanner: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    paddingTop: 48, // clears the status bar; adjust if you add a safe-area hook
-    paddingBottom: 14,
-    alignItems: 'center',
+  noFaceOverlay: {
+    position: 'absolute', top: 0, bottom: 0, left: 0, right: 0,
+    backgroundColor: 'rgba(0,0,0,0.55)', justifyContent: 'center', alignItems: 'center',
   },
-  alertBannerText: {
-    color: '#000',
-    fontWeight: '800',
-    fontSize: 16,
+  noFaceText: {
+    color: 'white',
+    fontSize: 40,
+    letterSpacing: 8,
+    textAlign: 'center',
+    // Built-in thin/ultralight system fonts: no font files or native linking needed.
+    fontFamily: Platform.select({ ios: 'HelveticaNeue-UltraLight', android: 'sans-serif-thin', default: undefined }),
+    fontWeight: '200',
   },
+  noFaceLine: { width: 56, height: 1, backgroundColor: 'rgba(255,255,255,0.7)', marginTop: 20 },
+  warningBanner: {
+    position: 'absolute', top: 60, left: 20, right: 20,
+    backgroundColor: 'rgba(239,68,68,0.92)', borderRadius: 14,
+    paddingVertical: 14, paddingHorizontal: 18,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+  },
+  warningIcon: { color: 'white', fontSize: 28, marginRight: 10 },
+  warningText: { color: 'white', fontSize: 20, fontWeight: 'bold', letterSpacing: 0.5 },
 });

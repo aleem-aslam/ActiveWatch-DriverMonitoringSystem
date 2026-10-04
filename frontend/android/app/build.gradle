@@ -24,6 +24,19 @@ android {
 
     buildToolsVersion rootProject.ext.buildToolsVersion
     
+    sourceSets {
+        main {
+            assets.srcDirs += ['../../node_modules/react-native-vision-camera-resizer/android/src/main/assets']
+        }
+    }
+    
+    packaging {
+        jniLibs {
+            pickFirst 'lib/**/libc++_shared.so'
+            pickFirst 'lib/**/libfbjni.so'
+        }
+    }
+
     buildFeatures {
     buildConfig = true
     }

@@ -1,68 +1,89 @@
 import { DrowsinessLevel, type DrowsinessSnapshot } from '../../types';
+import type { DetectionConfig } from './detectionConfig';
 
-// Two different thresholds (hysteresis) instead of one — this is what stops
-// the alert from flickering on/off when EAR noise hovers near a single
-// cutoff. Calibrate these per-device/lighting if needed.
-const EAR_CLOSE_THRESHOLD = 0.20; // below this -> counted as "closed"
-const EAR_OPEN_THRESHOLD = 0.25; // above this -> counted as "clearly open" again
+// Defaults match the previously tuned values; the app overrides them from the
+// user's Settings via setConfig() (see detectionConfig.ts).
+const DEFAULT_CONFIG: DetectionConfig = {
+  closeThreshold: 0.2,
+  openThreshold: 0.23,
+  drowsyMs: 1500,
+  warningMs: 800,
+};
 
-const WARNING_MS = 800; // eyes closed this long -> pre-alert state
-const DROWSY_MS = 1500; // eyes closed this long -> full alert (matches your spec)
+const OPEN_CONFIRM_FRAMES = 2; // consecutive open frames needed to clear (~100-200 ms), filters noise
 const NO_FACE_GRACE_MS = 500; // ignore a single dropped/failed frame
 
 /**
- * Plain class, not a worklet — this holds mutable state across time and
- * is meant to run on the JS thread, fed by runOnJS() from the frame
- * processor. Do NOT try to run this inside the worklet itself: React state
- * updates and audio playback (the beep) can only happen on the JS thread.
+ * Plain class (JS thread). Uses wall-clock timestamps rather than frame counts
+ * so FPS changes don't change the real-world thresholds.
  *
- * BUG THIS FIXES: counting "closed for N consecutive frames" assumes a
- * perfectly steady FPS. Inference time varies (thermal throttling, other
- * apps, older devices), so a frame-count threshold silently becomes a
- * different real-world duration over time. This tracks wall-clock
- * timestamps instead.
+ * - Thresholds and timing are configurable at runtime (setConfig).
+ * - While the face check fails inside the grace period, the caller passes
+ *   ear = 0; that is ignored and the previous state is held.
+ * - Recovery from DROWSY/WARNING is fast: a short run of clearly-open frames.
  */
 export class DrowsinessStateMachine {
+  private cfg: DetectionConfig = DEFAULT_CONFIG;
   private closedSinceMs: number | null = null;
   private lastFaceSeenMs: number = Date.now();
   private eyesCurrentlyClosed = false;
+  private openStreak = 0;
+  private lastSnapshot: DrowsinessSnapshot | null = null;
+
+  setConfig(cfg: DetectionConfig) {
+    this.cfg = cfg;
+  }
 
   update(ear: number, faceScore: number, isFacePresent: boolean, now = Date.now()): DrowsinessSnapshot {
     if (!isFacePresent) {
-      // Don't instantly flip to NO_FACE on one bad frame (blink motion blur,
-      // brief occlusion by a hand, etc.) — require a short grace period.
       if (now - this.lastFaceSeenMs > NO_FACE_GRACE_MS) {
         this.closedSinceMs = null;
         this.eyesCurrentlyClosed = false;
-        return this.snapshot(DrowsinessLevel.NO_FACE, ear, faceScore, now);
+        this.openStreak = 0;
+        return this.remember(this.snapshot(DrowsinessLevel.NO_FACE, 0, faceScore, now));
       }
-      // still within grace period — fall through and keep last known state
-    } else {
-      this.lastFaceSeenMs = now;
+      if (this.lastSnapshot) {
+        return this.remember({ ...this.lastSnapshot, faceScore, timestamp: now });
+      }
+      return this.remember(this.snapshot(DrowsinessLevel.NO_FACE, 0, faceScore, now));
     }
 
-    // Hysteresis: only flip state on a clear crossing, not on every wiggle
-    // around a single threshold.
-    if (!this.eyesCurrentlyClosed && ear < EAR_CLOSE_THRESHOLD) {
-      this.eyesCurrentlyClosed = true;
-      this.closedSinceMs = now;
-    } else if (this.eyesCurrentlyClosed && ear > EAR_OPEN_THRESHOLD) {
-      this.eyesCurrentlyClosed = false;
-      this.closedSinceMs = null;
+    this.lastFaceSeenMs = now;
+
+    if (!this.eyesCurrentlyClosed) {
+      if (ear < this.cfg.closeThreshold) {
+        this.eyesCurrentlyClosed = true;
+        this.closedSinceMs = now;
+        this.openStreak = 0;
+      }
+    } else if (ear > this.cfg.openThreshold) {
+      this.openStreak += 1;
+      if (this.openStreak >= OPEN_CONFIRM_FRAMES) {
+        this.eyesCurrentlyClosed = false;
+        this.closedSinceMs = null;
+        this.openStreak = 0;
+      }
+    } else {
+      this.openStreak = 0;
     }
 
     if (!this.eyesCurrentlyClosed || this.closedSinceMs === null) {
-      return this.snapshot(DrowsinessLevel.AWAKE, ear, faceScore, now);
+      return this.remember(this.snapshot(DrowsinessLevel.AWAKE, ear, faceScore, now));
     }
 
     const closedForMs = now - this.closedSinceMs;
-    if (closedForMs >= DROWSY_MS) {
-      return this.snapshot(DrowsinessLevel.DROWSY, ear, faceScore, now, closedForMs);
+    if (closedForMs >= this.cfg.drowsyMs) {
+      return this.remember(this.snapshot(DrowsinessLevel.DROWSY, ear, faceScore, now, closedForMs));
     }
-    if (closedForMs >= WARNING_MS) {
-      return this.snapshot(DrowsinessLevel.WARNING, ear, faceScore, now, closedForMs);
+    if (closedForMs >= this.cfg.warningMs) {
+      return this.remember(this.snapshot(DrowsinessLevel.WARNING, ear, faceScore, now, closedForMs));
     }
-    return this.snapshot(DrowsinessLevel.AWAKE, ear, faceScore, now, closedForMs);
+    return this.remember(this.snapshot(DrowsinessLevel.AWAKE, ear, faceScore, now, closedForMs));
+  }
+
+  private remember(s: DrowsinessSnapshot): DrowsinessSnapshot {
+    this.lastSnapshot = s;
+    return s;
   }
 
   private snapshot(
