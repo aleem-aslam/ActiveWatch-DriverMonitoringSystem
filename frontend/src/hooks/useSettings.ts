@@ -9,7 +9,20 @@ import { useCallback, useContext, useEffect, useState, useSyncExternalStore } fr
 import { AuthContext } from '../context/AuthContext';
 import { updateUserSettings } from '../firebase/userService';
 
+// What the camera screen runs: front camera only, rear camera only, or both together
+// (the last only on phones that can stream both cameras at once).
+export type MonitoringMode = 'driver' | 'road' | 'both';
+// Night / low-visibility handling on the road camera: detect it by itself, always on, or never.
+export type NightMode = 'auto' | 'on' | 'off';
+
 export const DEFAULT_SETTINGS = {
+  monitoringMode: 'driver' as MonitoringMode,
+  collisionTtcSeconds: 2.5, // road camera: time-to-collision below this -> collision alert
+  followingWarning: true, // road camera: warn when you follow the car ahead too closely
+  followingGapSeconds: 1.5, // ... closer than this many seconds of travel
+  laneDepartureWarning: true, // road camera: warn when you drift out of your lane
+  nightMode: 'auto' as NightMode, // road camera: brighten + lower the detection threshold in the dark / haze
+  distanceScale: 1, // road camera: distance calibration factor (1 = not calibrated)
   alertSound: true,
   vibration: true,
   drowsinessSensitivity: 80, // 0-100, higher = flags drowsiness more easily

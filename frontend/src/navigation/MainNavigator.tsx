@@ -9,7 +9,10 @@ import HomeScreen from '../screens/home/HomeScreen';
 import HistoryScreen from '../screens/history/HistoryScreen';
 import ProfileScreen from '../screens/profile/ProfileScreen';
 import SettingsScreen from '../screens/settings/SettingsScreen';
+// import CameraScreen from '../camera/DriverCameraScreen';
 import CameraScreen from '../camera/CameraScreen';
+import CalibrationScreen from '../camera/CalibrationScreen';
+import FirstRunGuide from '../screens/setup/FirstRunGuide';
 import { useTheme } from '../theme/ThemeContext';
 
 const Tab = createBottomTabNavigator();
@@ -106,10 +109,14 @@ function Tabs() {
 
 export default function MainNavigator() {
   return (
-    <Stack.Navigator screenOptions={{ headerShown: false }}>
-      <Stack.Screen name="Tabs" component={Tabs} />
-      <Stack.Screen name="Camera" component={CameraScreen} />
-    </Stack.Navigator>
+    <>
+      <Stack.Navigator screenOptions={{ headerShown: false }}>
+        <Stack.Screen name="Tabs" component={Tabs} />
+        <Stack.Screen name="Camera" component={CameraScreen} />
+        <Stack.Screen name="Calibration" component={CalibrationScreen} />
+      </Stack.Navigator>
+      <FirstRunGuide />
+    </>
   );
 }
 
