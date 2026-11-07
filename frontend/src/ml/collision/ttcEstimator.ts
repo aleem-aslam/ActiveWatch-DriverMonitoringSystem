@@ -65,20 +65,27 @@ const OUR_HALF_WIDTH_M = 0.95; // your car is ~1.9 m wide
 const CAMERA_TO_BUMPER_M = 1.0;
 const OBJ_DEPTH_M = 1.5; // we count a hit once the object's centre is this close to the bumper
 
-const MAX_RANGE_M = 60; // beyond this the estimate is too noisy to warn on
+const MAX_RANGE_M = 60; // beyond this the estimate is too noisy to show
+const WARN_RANGE_M = 45; // collision warnings only inside this range
 const HORIZON_S = 6; // how far ahead the path is predicted
 const MIN_CLOSING_MPS = 1.5; // slower closing than this (~5 km/h) is noise
 const LAT_DEADBAND_MPS = 0.6; // sideways speeds below this are treated as zero
-const LEAD_HALF_WIDTH_M = 2.0; // "ahead of me": within +-2 m of the centre line
+const LEAD_HALF_WIDTH_M = 1.5; // "ahead of me": within +-1.5 m of the centre line
+const EDGE_MARGIN = 0.015; // a box touching the left/right frame edge is only partly in view: its geometry is wrong, so it never raises a warning
 
-const VEL_WINDOW_MS = 1200;
-const SAMPLE_KEEP_MS = 1500;
+const VEL_WINDOW_MS = 1600; // slow window: steady, used to confirm that something is really closing in
+const FAST_WINDOW_MS = 900; // fast window: quicker, but both must agree
+const SAMPLE_KEEP_MS = 2000;
+const SIG_K = 3.0; // closing speed must be at least this many standard errors above zero
+const Z_JUMP_RATIO = 0.3; // distance jumping by more than this between frames = the track switched to another vehicle
+const OPENING_MPS = 0.8; // the car ahead is pulling away faster than this: no following warning
 const TRACK_LOST_MS = 700;
-const IOU_MATCH = 0.25;
-const MIN_HITS = 5; // frames a track must be seen before it can raise a warning
-const MIN_AGE_MS = 600;
-const MIN_SCORE_ALERT = 0.45;
-const CONFIRM_UPDATES = 3; // consecutive danger results before COLLISION
+const IOU_MATCH = 0.3;
+const SIZE_RATIO_MIN = 0.65; // a match must have a similar box height (stops two cars swapping identity)
+const MIN_HITS = 7; // frames a track must be seen before it can raise a warning
+const MIN_AGE_MS = 800;
+const MIN_SCORE_ALERT = 0.5;
+const CONFIRM_UPDATES = 4; // consecutive danger results before COLLISION
 const HOLD_MS = 800; // keep COLLISION on this long after the last danger frame (no flicker)
 
 // Hard braking of the car ahead:
@@ -107,10 +114,14 @@ type Track = {
   lastSeen: number;
   hits: number;
   hS: number; // smoothed box height
+  hRaw: number[]; // last few raw box heights (median removes single-frame spikes)
   z: number | null;
   x: number | null;
   samples: Sample[];
   vz: number | null; // forward velocity relative to you (m/s); negative = closing
+  vzC: number | null; // same, but only when it is clearly real (both windows agree, above the noise)
+  xS: number | null; // smoothed sideways offset
+  edge: boolean; // box touches the left/right frame edge
   vx: number | null;
   mode: boolean; // true when own GPS speed was used for vS
   vS: number | null; // smoothed (absolute or relative) forward speed
@@ -176,6 +187,35 @@ function slope(pts: { t: number; v: number }[]): number {
   return den !== 0 ? (n * sTV - sT * sV) / den : 0;
 }
 
+function median(a: number[]): number {
+  const b = [...a].sort((x, y) => x - y);
+  return b[Math.floor(b.length / 2)];
+}
+
+/** Same fit, plus the standard error of the slope (how noisy the slope is). */
+function slopeSE(pts: { t: number; v: number }[]): { s: number; se: number } {
+  const n = pts.length;
+  const t0 = pts[0].t;
+  let sT = 0, sV = 0, sTT = 0, sTV = 0;
+  for (const p of pts) {
+    const x = (p.t - t0) / 1000;
+    sT += x; sV += p.v; sTT += x * x; sTV += x * p.v;
+  }
+  const den = n * sTT - sT * sT;
+  if (den <= 0 || n < 3) return { s: 0, se: 1e9 };
+  const s = (n * sTV - sT * sV) / den;
+  const a = (sV - s * sT) / n;
+  let ssr = 0;
+  for (const p of pts) {
+    const x = (p.t - t0) / 1000;
+    const r = p.v - (a + s * x);
+    ssr += r * r;
+  }
+  const sxx = sTT - (sT * sT) / n;
+  const se = Math.sqrt(ssr / (n - 2) / Math.max(sxx, 1e-6));
+  return { s, se };
+}
+
 const RANK: Record<CollisionLevel, number> = { SAFE: 0, CAUTION: 1, COLLISION: 2 };
 
 export class TtcEstimator {
@@ -237,6 +277,8 @@ export class TtcEstimator {
       let bestIou = IOU_MATCH;
       for (const tr of free) {
         if (!sameKind(tr.det.classId, d.classId)) continue;
+        const hr = (d.y1 - d.y0) / Math.max(1e-6, tr.det.y1 - tr.det.y0);
+        if (hr < SIZE_RATIO_MIN || hr > 1 / SIZE_RATIO_MIN) continue;
         const v = iou(tr.det, d);
         if (v > bestIou) { bestIou = v; best = tr; }
       }
@@ -246,12 +288,14 @@ export class TtcEstimator {
         best.det = d;
         best.hits += 1;
         best.lastSeen = now;
-        best.hS = best.hS * 0.5 + h * 0.5;
+        best.hRaw.push(h);
+        if (best.hRaw.length > 3) best.hRaw.shift();
+        best.hS = best.hS * 0.5 + median(best.hRaw) * 0.5;
         updated.add(best);
       } else {
         const tr: Track = {
-          id: this.nextId++, det: d, firstSeen: now, lastSeen: now, hits: 1, hS: h,
-          z: null, x: null, samples: [], vz: null, vx: null,
+          id: this.nextId++, det: d, firstSeen: now, lastSeen: now, hits: 1, hS: h, hRaw: [h],
+          z: null, x: null, samples: [], vz: null, vzC: null, xS: null, edge: false, vx: null,
           mode: own !== null, vS: null, vHist: [], brakeUntil: 0, streak: 0, tHit: null,
           risk: 'SAFE', reason: 'NONE',
         };
@@ -267,29 +311,45 @@ export class TtcEstimator {
 
       const d = tr.det;
       const cut = d.y0 <= 0.01 || d.y1 >= 0.99;
+      tr.edge = d.x0 <= EDGE_MARGIN || d.x1 >= 1 - EDGE_MARGIN;
       if (!cut && tr.hS >= 0.03) {
         const realH = REAL_HEIGHT_M[d.classId] ?? 1.5;
         const z = (realH / (2 * tr.hS * tanV)) * this.distScale;
         const cx = (d.x0 + d.x1) / 2;
+        const lastS = tr.samples.length ? tr.samples[tr.samples.length - 1] : null;
+        if (lastS && now - lastS.t < 500 && Math.abs(z - lastS.z) / lastS.z > Z_JUMP_RATIO) {
+          // the box suddenly means another vehicle: forget the old motion
+          tr.samples = [];
+          tr.vz = null; tr.vzC = null; tr.vx = null; tr.vS = null; tr.vHist = []; tr.xS = null;
+        }
         tr.z = z;
         tr.x = z * (cx - this.pathCenterX) * 2 * tanH;
+        tr.xS = tr.xS === null ? tr.x : tr.xS * 0.6 + tr.x * 0.4;
         tr.samples.push({ t: now, z, x: tr.x });
         while (tr.samples.length > 0 && now - tr.samples[0].t > SAMPLE_KEEP_MS) tr.samples.shift();
       }
 
-      // velocity (relative to you)
-      const win = tr.samples.filter((p) => now - p.t <= VEL_WINDOW_MS);
-      if (win.length >= 5 && win[win.length - 1].t - win[0].t >= 400) {
-        const rz = slope(win.map((p) => ({ t: p.t, v: p.z })));
-        const rx = slope(win.map((p) => ({ t: p.t, v: p.x })));
+      // velocity (relative to you): a slow and a fast fit, which must agree
+      const slowPts = tr.samples.filter((p) => now - p.t <= VEL_WINDOW_MS);
+      const fastPts = tr.samples.filter((p) => now - p.t <= FAST_WINDOW_MS);
+      const slowOk = slowPts.length >= 6 && slowPts[slowPts.length - 1].t - slowPts[0].t >= 800;
+      const fastOk = fastPts.length >= 4 && fastPts[fastPts.length - 1].t - fastPts[0].t >= 400;
+      if (fastOk || slowOk) {
+        const zs = slowOk ? slopeSE(slowPts.map((p) => ({ t: p.t, v: p.z }))) : null;
+        const zf = fastOk ? slopeSE(fastPts.map((p) => ({ t: p.t, v: p.z }))) : null;
+        const rz = zs && zf ? Math.max(zs.s, zf.s) : (zs ?? zf)!.s; // the less alarming of the two
+        const rx = slope((slowOk ? slowPts : fastPts).map((p) => ({ t: p.t, v: p.x })));
         tr.vz = tr.vz === null ? rz : tr.vz * 0.5 + rz * 0.5;
         tr.vx = tr.vx === null ? rx : tr.vx * 0.5 + rx * 0.5;
+        // "clearly real" closing: needs the slow window and a slope well above its noise
+        const sig = zs ? -zs.s >= SIG_K * zs.se : false;
+        tr.vzC = slowOk && sig ? Math.min(tr.vz, 0) : 0;
       }
 
-      const isLead = tr.z !== null && tr.x !== null && Math.abs(tr.x) < LEAD_HALF_WIDTH_M && tr.z <= MAX_RANGE_M;
+      const isLead = !tr.edge && tr.z !== null && tr.xS !== null && Math.abs(tr.xS) < LEAD_HALF_WIDTH_M && tr.z <= MAX_RANGE_M;
       const eligible =
-        tr.hits >= MIN_HITS && now - tr.firstSeen >= MIN_AGE_MS && d.score >= MIN_SCORE_ALERT &&
-        tr.z !== null && tr.x !== null && tr.z <= MAX_RANGE_M && tr.vz !== null;
+        !tr.edge && tr.hits >= MIN_HITS && now - tr.firstSeen >= MIN_AGE_MS && d.score >= MIN_SCORE_ALERT &&
+        tr.z !== null && tr.xS !== null && tr.z <= WARN_RANGE_M && tr.vz !== null;
 
       // lead-vehicle speed series: vz = (its speed) - (your speed), so its speed = vz + yours
       if (tr.vz !== null) {
@@ -306,7 +366,10 @@ export class TtcEstimator {
           const drop = peak.v - tr.vS;
           const dt = (now - peak.t) / 1000;
           const ratioOk = tr.mode ? tr.vS <= peak.v * BRAKE_MIN_RATIO : true;
-          if (dt >= 0.4 && drop >= BRAKE_MIN_DROP_MPS && ratioOk && drop / dt >= BRAKE_MIN_DECEL) {
+          // Braking only counts when the gap really is closing (clearly above the measurement noise).
+          // Otherwise random jitter in the distance looks like "the car ahead lost 20 km/h".
+          const reallyClosing = tr.vzC !== null && tr.vzC <= -MIN_CLOSING_MPS;
+          if (dt >= 0.4 && drop >= BRAKE_MIN_DROP_MPS && ratioOk && drop / dt >= BRAKE_MIN_DECEL && reallyClosing) {
             tr.brakeUntil = now + BRAKE_HOLD_MS;
           }
         }
@@ -316,17 +379,20 @@ export class TtcEstimator {
       tr.tHit = null;
       let crossing = false;
       let half = OUR_HALF_WIDTH_M + (OBJ_HALF_WIDTH_M[d.classId] ?? 0.9);
-      if (eligible && tr.vz !== null && tr.vz <= -MIN_CLOSING_MPS && tr.z !== null && tr.x !== null) {
+      // Something that keeps pace with you or pulls away (its own speed >= yours) is never a collision threat.
+      const keepingPace = tr.mode && own !== null && tr.vS !== null && tr.vS >= own - 1.0;
+      const vzC = tr.vzC;
+      if (eligible && !keepingPace && vzC !== null && vzC <= -MIN_CLOSING_MPS && tr.z !== null && tr.xS !== null) {
         const vx0 = tr.vx ?? 0;
         const vx = Math.abs(vx0) < LAT_DEADBAND_MPS ? 0 : vx0;
         for (let t = 0; t <= HORIZON_S; t += 0.1) {
-          const zt = tr.z + tr.vz * t;
-          const xt = tr.x + vx * t;
+          const zt = tr.z + vzC * t;
+          const xt = tr.xS + vx * t;
           if (zt < -2) break;
-          const w = half + 0.02 * tr.z + 0.15 * t; // allow for measurement noise, growing with time
+          const w = half + 0.01 * tr.z + 0.1 * t; // allow for measurement noise, growing with time
           if (zt <= CAMERA_TO_BUMPER_M + OBJ_DEPTH_M && Math.abs(xt) < w) { tr.tHit = t; break; }
         }
-        crossing = Math.abs(vx) >= 1.0 && Math.abs(tr.x) > half;
+        crossing = Math.abs(vx) >= 1.2 && Math.abs(tr.xS) > half && now - tr.firstSeen >= 1200;
       }
 
       let risk: CollisionLevel = 'SAFE';
@@ -354,7 +420,7 @@ export class TtcEstimator {
     // ---- 6) overall result -----------------------------------------------------------
     const seen = this.tracks.filter((t) => now - t.lastSeen <= 300);
     const infos: TrackInfo[] = seen.map((t) => {
-      const lead = t.z !== null && t.x !== null && Math.abs(t.x) < LEAD_HALF_WIDTH_M;
+      const lead = !t.edge && t.z !== null && t.xS !== null && Math.abs(t.xS) < 3.5;
       return {
         id: t.id,
         det: t.det,
@@ -378,11 +444,13 @@ export class TtcEstimator {
     // nearest car ahead, for the distance / speed readout when nothing is wrong
     let lead: Track | null = null;
     for (const t of seen) {
-      if (t.z === null || t.x === null || Math.abs(t.x) >= LEAD_HALF_WIDTH_M) continue;
+      if (t.edge || t.z === null || t.xS === null || Math.abs(t.xS) >= LEAD_HALF_WIDTH_M) continue;
+      if (t.hits < MIN_HITS) continue;
       if (!lead || t.z < (lead.z ?? 1e9)) lead = t;
     }
     const shown = worst ?? lead;
     const leadInfo = lead ? infos.find((i) => i.id === lead!.id) : undefined;
+    const shownInfo = shown ? infos.find((i) => i.id === shown.id) : undefined;
 
     let level: CollisionLevel = worst ? worst.risk : 'SAFE';
     let reason: WarningReason = worst ? worst.reason : 'NONE';
@@ -390,11 +458,12 @@ export class TtcEstimator {
 
     // ---- following distance (only when nothing more urgent is going on) ----------------
     let headway: number | null = null;
-    if (lead && lead.z !== null && own !== null && own >= TAILGATE_MIN_SPEED_MPS && lead.hits >= MIN_HITS) {
+    const leadOpening = lead !== null && lead.mode && own !== null && lead.vS !== null && lead.vS - own >= OPENING_MPS;
+    if (lead && lead.z !== null && own !== null && own >= TAILGATE_MIN_SPEED_MPS && lead.hits >= 8 && now - lead.firstSeen >= 1500) {
       headway = lead.z / own;
     }
     const gap = this.cfg.followingGapSeconds;
-    if (this.cfg.followingEnabled && headway !== null && headway < gap) {
+    if (this.cfg.followingEnabled && headway !== null && headway < gap && !leadOpening) {
       if (this.tailSince === null) this.tailSince = now;
       if (headway < gap * TAILGATE_SEVERE_FACTOR) {
         if (this.tailSevereSince === null) this.tailSevereSince = now;
@@ -435,7 +504,7 @@ export class TtcEstimator {
       target,
       reason,
       message: messageFor(level, reason) + (youBraking ? ' (you are braking)' : ''),
-      leadSpeedKmh: leadInfo ? leadInfo.speedKmh : null,
+      leadSpeedKmh: shownInfo?.speedKmh ?? (leadInfo ? leadInfo.speedKmh : null),
       youBraking,
       headwaySeconds: headway,
       tracks: infos,

@@ -182,11 +182,13 @@ export function useRoadMonitor(ttcThresholdSeconds: number, onPhoto?: PhotoHandl
     list: Detection[], w: number, h: number, bestScore: number,
     rgba: ArrayBuffer | null, pw: number, ph: number,
     laneRan: boolean, laneRes: LaneResult | null,
-    mean: number, std: number
+    mean: number, std: number, frameTimeMs: number
   ) {
     frames.current += 1;
     last.current = { count: list.length, best: bestScore };
-    const now = Date.now();
+    // Time of the frame taken on the worklet thread. The JS thread can be busy and deliver results
+    // in bursts, which would make speeds (distance / time) jump around if we used Date.now() here.
+    const now = frameTimeMs > 0 ? frameTimeMs : Date.now();
 
     // lane -> where "straight ahead" is in the picture (slow smoothing)
     if (laneRan) {
@@ -266,6 +268,7 @@ export function useRoadMonitor(ttcThresholdSeconds: number, onPhoto?: PhotoHandl
         }
         try {
           const stats = sceneStats(frame);
+          const frameTime = Date.now();
           const input = frameToYoloInput(frame, size, channelsFirst, gainSync.getBlocking());
           const outputs = model.runSync([input.buffer as ArrayBuffer]);
           const raw = new Float32Array(outputs[0] as ArrayBuffer);
@@ -294,7 +297,7 @@ export function useRoadMonitor(ttcThresholdSeconds: number, onPhoto?: PhotoHandl
             pw = pic.w;
             ph = pic.h;
           }
-          scheduleOnRN(onResult, list, frame.width, frame.height, best, rgba, pw, ph, laneRan, laneRes, stats.mean, stats.std);
+          scheduleOnRN(onResult, list, frame.width, frame.height, best, rgba, pw, ph, laneRan, laneRes, stats.mean, stats.std, frameTime);
         } catch (error) {
           console.error('[road worklet]', error);
         } finally {

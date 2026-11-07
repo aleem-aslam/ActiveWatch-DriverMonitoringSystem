@@ -1,15 +1,14 @@
 import React, { useState } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
-
-import AuthInput from '../../components/auth/AuthInput';
-import AuthButton from '../../components/auth/AuthButton';
+import { StyleSheet, Text, TouchableOpacity } from 'react-native';
+import AuthLayout from '../../components/auth/AuthLayout';
+import AuthField from '../../components/auth/AuthField';
+import PrimaryButton from '../../components/auth/PrimaryButton';
 import { forgotPassword } from '../../firebase/auth';
 import { useTheme } from '../../theme/ThemeContext';
 import { getAuthErrorMessage } from '../../utils/firebaseErrors';
 
 export default function ForgotPasswordScreen({ navigation }: any) {
   const { colors } = useTheme();
-
   const [email, setEmail] = useState('');
   const [loading, setLoading] = useState(false);
   const [sent, setSent] = useState(false);
@@ -19,16 +18,8 @@ export default function ForgotPasswordScreen({ navigation }: any) {
 
   async function handleReset() {
     setErrorMessage(null);
-
-    if (!email.trim()) {
-      setErrorMessage('Please enter your email address.');
-      return;
-    }
-    if (!isValidEmail(email.trim())) {
-      setErrorMessage('Please enter a valid email address.');
-      return;
-    }
-
+    if (!email.trim()) return setErrorMessage('Please enter your email address.');
+    if (!isValidEmail(email.trim())) return setErrorMessage('Please enter a valid email address.');
     setLoading(true);
     try {
       await forgotPassword(email.trim());
@@ -42,50 +33,39 @@ export default function ForgotPasswordScreen({ navigation }: any) {
 
   if (sent) {
     return (
-      <View style={[styles.container, { backgroundColor: colors.background }]}>
-        <Text style={[styles.title, { color: colors.text }]}>Check Your Inbox</Text>
-        <Text style={[styles.subtitle, { color: colors.muted }]}>
+      <AuthLayout title="Check your inbox" subtitle="We sent you a reset link" icon="mail-open" compact>
+        <Text style={[styles.body, { color: colors.muted }]}>
           If an account exists for {email.trim()}, we've sent a link to reset your password.
         </Text>
-        <AuthButton title="Back to Login" onPress={() => navigation.navigate('Login')} style={{ marginTop: 30 }} />
-      </View>
+        <PrimaryButton title="Back to Login" onPress={() => navigation.navigate('Login')} />
+      </AuthLayout>
     );
   }
 
   return (
-    <View style={[styles.container, { backgroundColor: colors.background }]}>
-      <Text style={[styles.title, { color: colors.text }]}>Reset Password</Text>
-      <Text style={[styles.subtitle, { color: colors.muted }]}>
-        Enter your email and we'll send you a link to reset your password.
-      </Text>
-
-      <AuthInput
+    <AuthLayout title="Reset password" subtitle="Enter your email and we'll send you a reset link" icon="key" compact>
+      <AuthField
+        icon="mail-outline"
         placeholder="Email"
         value={email}
-        onChangeText={(v) => {
-          setEmail(v);
-          if (errorMessage) setErrorMessage(null);
-        }}
+        onChangeText={(v) => { setEmail(v); if (errorMessage) setErrorMessage(null); }}
         keyboardType="email-address"
         editable={!loading}
+        returnKeyType="go"
+        onSubmitEditing={handleReset}
       />
+      {errorMessage ? <Text style={[styles.error, { color: colors.danger }]}>{errorMessage}</Text> : null}
 
-      {errorMessage ? (
-        <Text style={[styles.error, { color: colors.danger }]}>{errorMessage}</Text>
-      ) : null}
+      <PrimaryButton title="Send Email" onPress={handleReset} loading={loading} />
 
-      <AuthButton title="Send Email" onPress={handleReset} loading={loading} style={{ marginTop: 10 }} />
-
-      <TouchableOpacity onPress={() => navigation.navigate('Login')} disabled={loading} style={{ marginTop: 25 }}>
-        <Text style={{ color: colors.primary, textAlign: 'center' }}>Back to Login</Text>
+      <TouchableOpacity onPress={() => navigation.navigate('Login')} disabled={loading} style={{ marginTop: 22 }}>
+        <Text style={{ color: colors.primary, textAlign: 'center', fontWeight: '600' }}>Back to login</Text>
       </TouchableOpacity>
-    </View>
+    </AuthLayout>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: 'center', padding: 30 },
-  title: { fontSize: 32, fontWeight: '700', marginBottom: 10 },
-  subtitle: { fontSize: 15, marginBottom: 30, lineHeight: 21 },
-  error: { fontSize: 14, marginBottom: 10, marginTop: -5 },
+  body: { fontSize: 15, lineHeight: 22, marginBottom: 24 },
+  error: { fontSize: 14, marginBottom: 12, marginTop: -4 },
 });
