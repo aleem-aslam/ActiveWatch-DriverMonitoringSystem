@@ -1,0 +1,102 @@
+# =========================
+# OS
+# =========================
+
+.DS_Store
+Thumbs.db
+
+
+# =========================
+# IDE
+# =========================
+
+.idea/
+.vscode/
+
+
+# =========================
+# React Native / Node
+# =========================
+
+node_modules/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+.metro/
+.metro-health-check*
+
+coverage/
+
+
+# =========================
+# Android
+# =========================
+
+**/android/.gradle/
+**/android/build/
+**/android/app/build/
+
+**/.cxx/
+
+local.properties
+
+*.iml
+*.hprof
+
+.kotlin/
+
+*.keystore
+!debug.keystore
+
+
+# =========================
+# iOS
+# =========================
+
+build/
+
+Pods/
+
+*.ipa
+
+DerivedData/
+
+xcuserdata/
+
+*.xcuserstate
+
+
+# =========================
+# React Native bundle
+# =========================
+
+*.jsbundle
+
+
+# =========================
+# Backend Python
+# =========================
+
+__pycache__/
+
+*.pyc
+
+*.pyo
+
+.env
+
+
+# =========================
+# Firebase Credentials
+# =========================
+
+backend/firebase-credentials.json
+
+
+# =========================
+# Temporary files
+# =========================
+
+*.log
